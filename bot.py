@@ -51,24 +51,13 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PROXY = os.getenv("PROXY")
-MAX_DL = int(os.getenv("MAX_PARALLEL", "4"))
-MAX_UP = int(os.getenv("MAX_UPLOADS", "3"))
-PER_BATCH = int(os.getenv("PER_BATCH", "3"))
-MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "30"))
-MAX_GALLERY = int(os.getenv("MAX_GALLERY", "30"))
-MAX_ACTIVE_BATCHES = int(os.getenv("MAX_ACTIVE_BATCHES", "2"))
+# مفيش حدود تطبيقية للتحميل: الدفعات والقوائم والروابط والتزامن بلا سقف.
+MAX_PLAYLIST = MAX_GALLERY = 0
 CONN = int(os.getenv("CONNECTIONS", "16"))
 FRAGMENTS = int(os.getenv("FRAGMENTS", "16"))             # أجزاء HLS/DASH بالتوازي
 UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "12"))   # طلبات رفع متوازية للملف الواحد (الافتراضي في المكتبة 4)
-MAX_LINKS, MAX_ITEMS = 10, 50
-MAX_PROBES = int(os.getenv("MAX_PROBES", "4"))            # فحص روابط متزامن (كان من غير حد)
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))         # عناصر/يوم لكل مستخدم عادي (0 = بلا حد). الأدمن مستثنى
-RATE_SECONDS = float(os.getenv("RATE_SECONDS", "3"))      # أقل فاصل بين رسالتين روابط من نفس المستخدم
-HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "90"))
-MAX_CACHE_ROWS = int(os.getenv("MAX_CACHE_ROWS", "50000"))
-# قائمة المسموح لهم: فاضية = البوت مفتوح للكل (لكن الكوتة اليومية بتفضل شغالة)
-MAX_DURATION = int(os.getenv("MAX_DURATION_MIN", "180")) * 60   # أقصى مدة فيديو بالثواني (0 = بلا حد)
-MIN_FREE_MB = int(os.getenv("MIN_FREE_MB", "3000"))           # أقل مساحة فاضية على القرص قبل بدء تحميل جديد
+# البوت عام افتراضيًا؛ لا حصة أو حد لطول الفيديو المسجل.
+MIN_FREE_MB = 0
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()}
 MAX_SIZE = 2000 * 1024 * 1024
 DB_PATH = os.getenv("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
@@ -108,20 +97,25 @@ def tune_upload(workers):
 
 UPLOAD_TUNED = tune_upload(UPLOAD_WORKERS) if UPLOAD_WORKERS > 4 else False
 
-# max_concurrent_transmissions: بدونها المكتبة بترفع ملف واحد بس في نفس الوقت (الافتراضي 1)
+class UnlimitedSemaphore:
+    """واجهة semaphore بلا سقف؛ تمرير acquire لا ينتظر ولا يحجز موردًا."""
+    async def acquire(self): return True
+    def release(self): pass
+    def locked(self): return False
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc, tb): return False
+
+UNLIMITED = UnlimitedSemaphore()
+
+# نستبدل semaphores الداخلية للمكتبة أيضًا حتى لا يبقى سقف تزامن مخفي.
 app = Client("vidbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             in_memory=True, workers=32, max_concurrent_transmissions=max(MAX_UP, 1))
-DL_SEM = asyncio.Semaphore(MAX_DL)
-PER_USER_DL = max(1, int(os.getenv("PER_USER_DL", "2")))   # أقصى تحميلات متزامنة لمستخدم واحد (عدالة بين المستخدمين)
-user_dl_sems: dict[int, asyncio.Semaphore] = {}
+             in_memory=True, workers=32, max_concurrent_transmissions=1)
+app.save_file_semaphore = UNLIMITED
+app.get_file_semaphore = UNLIMITED
+DL_SEM = UP_SEM = PROBE_SEM = UNLIMITED
 
 def user_sem(uid):
-    s = user_dl_sems.get(uid)
-    if s is None: s = user_dl_sems[uid] = asyncio.Semaphore(PER_USER_DL)
-    return s
-UP_SEM = asyncio.Semaphore(MAX_UP)
-PROBE_SEM = asyncio.Semaphore(MAX_PROBES)
-last_req: dict[int, float] = {}
+    return UNLIMITED
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -160,8 +154,6 @@ def db_exec(q, args=()):
 # ───────────── إعدادات الأدمن (بتتغير من لوحة الأدمن وبتتخزن في القاعدة) ─────────────
 # قيم المتغيرات (Variables) هنا هي القيم الابتدائية بس؛ أي تغيير من اللوحة بيتخزن ويغلب عليها.
 SETTING_DEFAULTS = {
-    "daily_limit": str(DAILY_LIMIT),            # عناصر/يوم لكل مستخدم عادي (0 = بلا حد)
-    "max_duration": str(MAX_DURATION // 60),    # أقصى مدة فيديو بالدقايق (0 = بلا حد)
     "public": "0" if ALLOWED_IDS else "1",      # 1 = البوت مفتوح للكل، 0 = خاص (الأدمن + المسموح لهم)
     "wm_on": "0",                               # العلامة المائية شغّالة؟
     "wm_type": "text",                          # text | image
@@ -178,13 +170,6 @@ def cfg(key):
 def cfg_set(key, val):
     CFG[key] = str(val)
     db_exec("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, str(val)))
-
-def _cfg_int(key):
-    try: return max(int(CFG[key]), 0)
-    except ValueError: return 0
-
-def daily_limit():       return _cfg_int("daily_limit")      # 0 = بلا حد
-def max_duration_min():  return _cfg_int("max_duration")     # 0 = بلا حد
 
 def cache_get(key, mode):
     r = db_exec("SELECT file_id FROM cache WHERE key=? AND mode=?", (key, mode))
@@ -211,30 +196,6 @@ def record(uid, title, mode):
     db_exec("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
     db_exec("INSERT INTO history VALUES (?,?,?,?)", (uid, title[:80], mode, int(time.time())))
 
-def today():
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-def quota_left(uid):
-    if is_admin(uid) or daily_limit() <= 0: return 10 ** 9
-    r = db_exec("SELECT n FROM usage WHERE user_id=? AND day=?", (uid, today()))
-    return max(daily_limit() - (r[0][0] if r else 0), 0)
-
-def quota_add(uid, n):
-    """بيزوّد (أو بيرجّع لو n سالب) استهلاك اليوم."""
-    if is_admin(uid) or daily_limit() <= 0 or n == 0: return
-    db_exec("INSERT INTO usage(user_id, day, n) VALUES (?,?,MAX(?,0)) "
-            "ON CONFLICT(user_id, day) DO UPDATE SET n = MAX(n + ?, 0)", (uid, today(), n, n))
-
-def cleanup_db():
-    now = int(time.time())
-    db_exec("DELETE FROM history WHERE ts < ?", (now - HISTORY_DAYS * 86400,))
-    db_exec("DELETE FROM usage WHERE day < ?", (time.strftime("%Y-%m-%d", time.gmtime(now - 7 * 86400)),))
-    db_exec("DELETE FROM cache WHERE rowid IN (SELECT rowid FROM cache ORDER BY ts DESC LIMIT -1 OFFSET ?)",
-            (MAX_CACHE_ROWS,))
-    db_exec("DELETE FROM urlmap WHERE ts < ?", (now - 30 * 86400,))
-    db_exec("DELETE FROM urlmap WHERE rowid IN (SELECT rowid FROM urlmap ORDER BY ts DESC LIMIT -1 OFFSET ?)",
-            (MAX_CACHE_ROWS,))
-
 def clean_stale_tmp(max_age=3600):
     """بقايا تحميلات اتقطعت (Crash / إعادة تشغيل) — بتتمسح عشان القرص ما يمتلاش."""
     tmp, now = tempfile.gettempdir(), time.time()
@@ -246,17 +207,6 @@ def clean_stale_tmp(max_age=3600):
                 shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
         except OSError:
             pass
-
-async def cleanup_loop():
-    while True:
-        cut = time.time() - 3600
-        for k in [k for k, v in last_req.items() if v < cut]: last_req.pop(k, None)
-        for k in [k for k, s in user_dl_sems.items() if getattr(s, "_value", None) == PER_USER_DL]: user_dl_sems.pop(k, None)
-        try:
-            await asyncio.to_thread(cleanup_db)
-            await asyncio.to_thread(clean_stale_tmp)
-        except Exception as e: log.warning("cleanup failed: %s", e)
-        await asyncio.sleep(6 * 3600)
 
 def get_pref(uid):
     r = db_exec("SELECT quality FROM users WHERE id=?", (uid,))
@@ -284,14 +234,13 @@ class Batch:
     user_id: int
     chat_id: int
     items: list
-    created: float = field(default_factory=time.time)
     mode: str = "720"
     cancelled: bool = False
     done: bool = False
     started: bool = False
     started_at: float = 0.0
     msg: object = None
-    sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(PER_BATCH))
+    sem: UnlimitedSemaphore = field(default_factory=lambda: UNLIMITED)
 
 batches: dict[str, Batch] = {}
 awaiting: dict[int, str] = {}
@@ -456,7 +405,8 @@ def is_single_video(url):
 def probe_ytdlp(url, referer=None):
     single = is_single_video(url)
     o = base_opts(referer)
-    o.update(extract_flat="in_playlist", noplaylist=single, playlistend=MAX_PLAYLIST)
+    o.update(extract_flat="in_playlist", noplaylist=single)
+    if MAX_PLAYLIST > 0: o["playlistend"] = MAX_PLAYLIST
     info = ydl_run(url, o, False)
     items, ptitle = [], None
     if info.get("_type") == "playlist":
@@ -470,7 +420,7 @@ def probe_ytdlp(url, referer=None):
                 else: continue
             if not url_ok(u): continue
             items.append(Item(u, e.get("title") or u, f"{ie}:{eid or u}", referer=referer or ""))
-            if len(items) >= MAX_PLAYLIST: break
+            if MAX_PLAYLIST > 0 and len(items) >= MAX_PLAYLIST: break
     else:
         ie = (info.get("extractor_key") or "x").lower()
         items.append(Item(url, info.get("title") or url, f"{ie}:{info.get('id') or url}",
@@ -530,7 +480,7 @@ def sniff(url):
             seen.add(c); urls.append(c)
     m = TITLE_RE.search(txt)
     title = (m.group(1) or m.group(2)).strip() if m else ""
-    for c in urls[:8]:
+    for c in urls:
         try:
             items, _ = probe_ytdlp(c, referer=url)
         except Exception:
@@ -550,11 +500,11 @@ def gallery_supported(url):
     except Exception: return False
 
 def do_gallery(url, outdir):
-    cmd = ["gallery-dl", "-q", "-D", outdir, "-f", "{num:>03}.{extension}",
-           "--range", f"1-{MAX_GALLERY}"]
+    cmd = ["gallery-dl", "-q", "-D", outdir, "-f", "{num:>03}.{extension}"]
+    if MAX_GALLERY > 0: cmd += ["--range", f"1-{MAX_GALLERY}"]
     if COOKIES_FILE: cmd += ["-C", COOKIES_FILE]
     if PROXY: cmd += ["--proxy", PROXY]
-    r = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=600)
+    r = subprocess.run(cmd + [url], capture_output=True, text=True)
     files = sorted(os.path.join(outdir, f) for f in os.listdir(outdir)
                    if os.path.isfile(os.path.join(outdir, f)) and not f.endswith((".json", ".txt", ".part")))
     if not files:
@@ -578,13 +528,10 @@ def probe(url):
             raise first
 
 def check_limits(info):
-    """بيرفض البث المباشر والفيديوهات الأطول من الحد قبل ما نصرف باندويث."""
+    """يرفض البث المباشر فقط؛ لا يوجد حد لمدة الفيديو المسجل."""
     if not info: return
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
         raise RuntimeError("live event")                      # بيتحوّل لرسالة عربي من ERR_MAP
-    dur, mx = info.get("duration"), max_duration_min() * 60
-    if mx and dur and dur > mx:
-        raise RuntimeError(f"الفيديو أطول من الحد المسموح ({mx // 60} دقيقة)")
 
 def _match_filter(info, *, incomplete=False):
     if not incomplete: check_limits(info)
@@ -930,30 +877,12 @@ async def run_batch(b):
     await asyncio.gather(*tasks, return_exceptions=True)
     b.done = True
     ui.cancel()
-    quota_add(b.user_id, -sum(1 for i in b.items if i.status == "err"))   # الفاشل ما يتحسبش
     await safe_edit(b.msg, render(b, final=True), after_kb())
     batches.pop(b.id, None)
 
 async def begin(b, answer=None):
-    """نقطة بدء واحدة لأي دفعة: بتطبق الكوتة اليومية وبعدها بتشغّل الدفعة."""
-    left = quota_left(b.user_id)
-    if left <= 0:
-        batches.pop(b.id, None)
-        await safe_edit(b.msg, f"🚫 خلصت حدك اليومي ({daily_limit()} عنصر). جرّب بكرة 🙂", back_kb())
-        return
-    trimmed = len(b.items) > left
-    if trimmed:
-        b.items = b.items[:left]
-    quota_add(b.user_id, len(b.items))
-    if trimmed:
-        try: await app.send_message(b.chat_id, f"⚠️ الحد اليومي: هحمّل أول {left} عنصر بس.")
-        except Exception: pass
+    """يبدأ الدفعة بلا حصة يومية أو اقتطاع للعناصر."""
     asyncio.create_task(run_batch(b))
-
-def gc_batches():
-    for k, v in list(batches.items()):
-        if not v.started and time.time() - v.created > 1800:
-            batches.pop(k, None)
 
 # ───────────── الشاشات ─────────────
 def welcome_text(name):
@@ -1056,25 +985,16 @@ async def broadcast(admin_cq, chat_id, msg_id):
 
 # ───────────── شاشات إعدادات الأدمن ─────────────
 def cf_text():
-    dl, du = daily_limit(), max_duration_min()
     return ("⚙️ إعدادات البوت\n\n"
-            f"📥 الحد اليومي لكل مستخدم: {dl if dl else '♾ بلا حد'}  (الأدمن مستثنى)\n"
-            f"⏱ أقصى مدة للفيديو: {f'{du} دقيقة' if du else '♾ بلا حد'}\n"
+            "📥 عدد التنزيلات: ♾ بلا حد يومي\n"
+            "⏱ مدة الفيديو المسجل: ♾ بلا حد\n"
             f"👥 الوصول: {'🌍 عام (أي حد)' if cfg('public') == '1' else '🔒 خاص (الأدمن + المسموح لهم بس)'}\n\n"
-            "التغيير بيتطبق فورًا على الطلبات الجديدة.\n"
+            "طلبات وروابط ودفعات متعددة متزامنة بلا سقف تطبيقي.\n"
             "للوصول الخاص: /allow <id> و /unallow <id> لإضافة/شيل مستخدم.")
 
 def cf_kb():
-    dl, du = daily_limit(), max_duration_min()
-    def mk(label, cur, val, data):
-        sel = cur == val
-        return B(("✅ " if sel else "") + label, data, S.SUCCESS if sel else S.PRIMARY)
     pub = cfg("public") == "1"
     return KB(
-        [mk(f"📥 {n}" if n else "📥 ♾", dl, n, f"ad|cf|dl|{n}") for n in (10, 30, 100, 0)],
-        [B("✏️ رقم مخصص للحد اليومي", "ad|cf|dlx")],
-        [mk(f"⏱ {n}د" if n else "⏱ ♾", du, n, f"ad|cf|du|{n}") for n in (30, 60, 180, 0)],
-        [B("✏️ رقم مخصص للمدة", "ad|cf|dux")],
         [B("🌍 عام — اضغط لتخليه خاص" if pub else "🔒 خاص — اضغط لتخليه عام", "ad|cf|pub",
            S.SUCCESS if pub else S.DANGER)],
         [B("🔙 رجوع", "ad")],
@@ -1111,12 +1031,6 @@ async def admin_input(m, uid, st):
     """ردود الأدمن على أسئلة لوحة الإعدادات (رقم / نص / صورة)."""
     awaiting.pop(uid, None)
     txt = " ".join((m.text or "").split())
-    if st in ("cf_dl", "cf_dur"):
-        if not txt.isdigit() or int(txt) > 100000:
-            awaiting[uid] = st
-            return await m.reply_text("ابعت رقم صحيح (0 = بلا حد).")
-        cfg_set("daily_limit" if st == "cf_dl" else "max_duration", int(txt))
-        return await m.reply_text("✅ اتحفظ\n\n" + cf_text(), reply_markup=cf_kb())
     if st == "wm_text":
         if not txt or len(txt) > 60:
             awaiting[uid] = st
@@ -1188,7 +1102,7 @@ async def on_message(_, m):
     uid = m.from_user.id
     if not is_allowed(uid):
         return await m.reply_text("🔒 البوت ده خاص. كلّم صاحبه علشان يفعّلك.")
-    touch_user(uid); gc_batches()
+    touch_user(uid)
 
     if awaiting.get(uid) == "bc" and is_admin(uid):
         awaiting.pop(uid)
@@ -1198,18 +1112,12 @@ async def on_message(_, m):
                                   reply_markup=KB([B("✅ تأكيد الإرسال", "ad|bc|ok", S.SUCCESS)],
                                                   [B("❌ إلغاء", "ad|bc|no", S.DANGER)]))
 
-    if is_admin(uid) and awaiting.get(uid) in ("cf_dl", "cf_dur", "wm_text", "wm_img"):
+    if is_admin(uid) and awaiting.get(uid) in ("wm_text", "wm_img"):
         return await admin_input(m, uid, awaiting[uid])
 
-    urls = list(dict.fromkeys(u.rstrip(".,;:!?)]}،؛") for u in URL_RE.findall(m.text or "")))[:MAX_LINKS]
+    urls = list(dict.fromkeys(u.rstrip(".,;:!?)]}،؛") for u in URL_RE.findall(m.text or "")))
     if not urls:
         return await m.reply_text("ابعت لينك صحيح 🙂 أو ارجع للقائمة 👇", reply_markup=menu_kb(uid))
-    now = time.time()
-    if not is_admin(uid) and now - last_req.get(uid, 0) < RATE_SECONDS:
-        return await m.reply_text("⏳ على مهلك شوية، ابعت الرابط التالي بعد ثواني.")
-    last_req[uid] = now
-    if quota_left(uid) <= 0:
-        return await m.reply_text(f"🚫 خلصت حدك اليومي ({daily_limit()} عنصر). جرّب بكرة 🙂", reply_markup=back_kb())
     blocked = [u for u in urls if is_blocked(u)]
     urls = [u for u in urls if u not in blocked]
     if not urls:
@@ -1218,9 +1126,6 @@ async def on_message(_, m):
     urls = [u for u, ok in zip(urls, safe) if ok]
     if not urls:
         return await m.reply_text("❌ الرابط غير صالح.", reply_markup=back_kb())
-    if sum(1 for x in batches.values() if x.user_id == uid and x.started) >= MAX_ACTIVE_BATCHES:
-        return await m.reply_text("عندك تحميلات شغالة دلوقتي، استنى لما تخلص أو الغيها.")
-
     wait = await m.reply_text(f"⏳ بفحص {len(urls)} رابط...")
     async def _probe(u):
         hit = await asyncio.to_thread(urlmap_get, u)          # اتحمل قبل كده؟ بنتخطى الفحص ونرد فورًا من الكاش
@@ -1235,7 +1140,6 @@ async def on_message(_, m):
             items += r[0]; pl = pl or r[1]
             if len(r[0]) == 1 and r[0][0].engine == "ytdlp" and r[0][0].url == u and not r[0][0].key.startswith("sniff:"):
                 urlmap_put(u, r[0][0].key, r[0][0].title)
-    items = items[:MAX_ITEMS]
     if not items:
         return await wait.edit_text("❌ مقدرتش أحمّل الرابط:\n" + "\n".join(fails), reply_markup=back_kb())
 
@@ -1332,7 +1236,7 @@ async def on_cb(_, cq):
             return await show(cq, f"📊 إحصائيات\n\n👥 مستخدمين: {u[0]}\n📥 تحميلات: {u[1]}\n"
                                   f"⚡ في الكاش: {c}\n🔄 دفعات شغالة: {len(batches)}\n"
                                   f"👤 نشطين 24س: {act24}  |  🚫 محظورين: {bn}" + chr(10) +
-                                  f"🚦 حد يومي: {daily_limit() or '∞'}  |  الوصول: {'عام' if cfg('public') == '1' else 'خاص'}\n"
+                                  f"🚦 حدود التنزيل: بلا حد  |  الوصول: {'عام' if cfg('public') == '1' else 'خاص'}\n"
                                   f"💧 علامة مائية: {'✅' if cfg('wm_on') == '1' else '⛔'}\n\n"
                                   f"🧩 aria2c: {'✅' if HAS_ARIA2 else '❌'}  "
                                   f"تقليد المتصفح: {'✅' if IMPERSONATE else '❌'}  "
@@ -1355,15 +1259,9 @@ async def on_cb(_, cq):
                 return asyncio.create_task(broadcast(cq, *p))
         if sub == "cf":
             awaiting.pop(uid, None)
-            a, v = (d[2] if len(d) > 2 else ""), (d[3] if len(d) > 3 else "")
-            if a in ("dl", "du") and v.isdigit():
-                cfg_set("daily_limit" if a == "dl" else "max_duration", int(v))
-            elif a == "pub":
+            a = d[2] if len(d) > 2 else ""
+            if a == "pub":
                 cfg_set("public", "0" if cfg("public") == "1" else "1")
-            elif a in ("dlx", "dux"):
-                awaiting[uid] = "cf_dl" if a == "dlx" else "cf_dur"
-                what = "الحد اليومي (عناصر/يوم)" if a == "dlx" else "أقصى مدة (بالدقايق)"
-                return await show(cq, f"✏️ ابعت {what} كرقم — 0 = بلا حد", KB([B("🔙 رجوع", "ad|cf")]))
             return await show(cq, cf_text(), cf_kb())
         if sub == "wm":
             awaiting.pop(uid, None)
@@ -1411,9 +1309,7 @@ async def main():
     log.info("sites: %s | aria2c: %s | impersonate: %s | gallery-dl: %s | uvloop: %s | upload-workers: %s | colors: %s | db: %s",
              SITE_COUNT, HAS_ARIA2, bool(IMPERSONATE), HAS_GALLERY, HAS_UVLOOP,
              UPLOAD_WORKERS if UPLOAD_TUNED else 4, COLORS, DB_PATH)
-    cleanup = asyncio.create_task(cleanup_loop())
     await idle()
-    cleanup.cancel()
     await app.stop()
 
 if __name__ == "__main__":

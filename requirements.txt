@@ -1,0 +1,5 @@
+kurigram==2.2.26
+tgcrypto==1.2.5
+uvloop
+yt-dlp[default,curl-cffi]
+gallery-dl

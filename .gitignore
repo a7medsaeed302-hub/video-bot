@@ -1,0 +1,21 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Runtime state and Telegram sessions
+/data/
+data/
+*.db
+*.db-*
+*.session
+*.session-journal
+
+# Logs and downloaded/generated media
+*.log
+/downloads/
+/tmp/

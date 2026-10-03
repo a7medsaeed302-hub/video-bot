@@ -1,0 +1,8 @@
+# تشغيل البوت على أي VPS:  docker compose up -d --build
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data        # قاعدة البيانات والكاش (بتفضل بعد إعادة التشغيل)

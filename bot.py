@@ -371,6 +371,26 @@ def admin_kb():
 # ───────────── yt-dlp (مع تقليد المتصفح) ─────────────
 RETRY_IMP = re.compile(r"403|forbidden|cloudflare|just a moment|captcha|429|impersonat|"
                        r"unable to download webpage|unsupported url|timed out|challenge", re.I)
+ARIA2_EXIT = re.compile(r"aria2c exited with code\s+(\d+)", re.I)
+
+def aria2_exit_code(error):
+    match = ARIA2_EXIT.search(str(error))
+    return int(match.group(1)) if match else None
+
+def native_downloader_opts(opts):
+    """نسخة من خيارات yt-dlp من غير aria2، لاستخدام المحمّل الأصلي عند الحاجة."""
+    native = dict(opts)
+    native.pop("external_downloader", None)
+    native.pop("external_downloader_args", None)
+    return native
+
+def note_aria2_failure(error):
+    global HAS_ARIA2
+    code = aria2_exit_code(error)
+    if code == 28 and HAS_ARIA2:
+        HAS_ARIA2 = False
+        log.error("aria2 rejected a command-line option (exit 28); disabling aria2 for this process")
+    return code is not None
 
 def base_opts(referer=None):
     o = {"quiet": True, "no_warnings": True, "retries": 10, "fragment_retries": 10,
@@ -385,16 +405,27 @@ def ydl_run(url, opts, download):
     try:
         with yt_dlp.YoutubeDL(opts) as y:
             return y.extract_info(url, download=download)
-    except Exception as e:
-        if IMPERSONATE and RETRY_IMP.search(str(e)):
-            o2 = dict(opts); o2["impersonate"] = IMPERSONATE
-            o2.pop("external_downloader", None); o2.pop("external_downloader_args", None)
+    except Exception as initial_error:
+        error = initial_error
+        if opts.get("external_downloader") and note_aria2_failure(error):
+            native = native_downloader_opts(opts)
+            log.warning("aria2 download failed (code %s); retrying with yt-dlp native downloader",
+                        aria2_exit_code(error))
+            try:
+                with yt_dlp.YoutubeDL(native) as y:
+                    return y.extract_info(url, download=download)
+            except Exception as native_error:
+                error = native_error
+                log.warning("native downloader retry failed: %s", native_error)
+        if IMPERSONATE and RETRY_IMP.search(str(error)):
+            o2 = native_downloader_opts(opts)
+            o2["impersonate"] = IMPERSONATE
             try:
                 with yt_dlp.YoutubeDL(o2) as y:
                     return y.extract_info(url, download=download)
-            except Exception:
-                pass
-        raise
+            except Exception as impersonate_error:
+                error = impersonate_error
+        raise error
 
 YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 
@@ -596,6 +627,14 @@ def do_download(it, mode, outdir, progress_hook=None):
                 try: os.remove(os.path.join(outdir, f))
                 except OSError: pass
             info = None
+            if o.get("external_downloader") and note_aria2_failure(e):
+                o = native_downloader_opts(o)
+                log.warning("aria2 failed on reused probe info; retrying with yt-dlp native downloader")
+                try:
+                    with yt_dlp.YoutubeDL(o) as y:
+                        info = y.process_ie_result(copy.deepcopy(it.info), download=True)
+                except Exception as native_error:
+                    log.info("native retry of reused probe info failed: %s", native_error)
     if info is None:
         info = ydl_run(it.url, o, True)
     files = [os.path.join(outdir, f) for f in os.listdir(outdir)]

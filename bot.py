@@ -53,9 +53,13 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PROXY = os.getenv("PROXY")
 # مفيش حدود تطبيقية للتحميل: الدفعات والقوائم والروابط والتزامن بلا سقف.
 MAX_PLAYLIST = MAX_GALLERY = 0
-CONN = int(os.getenv("CONNECTIONS", "16"))
-FRAGMENTS = int(os.getenv("FRAGMENTS", "16"))             # أجزاء HLS/DASH بالتوازي
-UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "12"))   # طلبات رفع متوازية للملف الواحد (الافتراضي في المكتبة 4)
+TRANSFER_PROFILE = os.getenv("TRANSFER_PROFILE", "fast").strip().lower()
+CONN = int(os.getenv("CONNECTIONS", "24"))
+FRAGMENTS = int(os.getenv("FRAGMENTS", "24"))
+UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "16"))
+if TRANSFER_PROFILE == "fast":
+    # يضمن تطبيق السرعة الجديدة حتى لو كانت متغيرات Railway القديمة أقل.
+    CONN, FRAGMENTS, UPLOAD_WORKERS = max(CONN, 24), max(FRAGMENTS, 24), max(UPLOAD_WORKERS, 16)
 # البوت عام افتراضيًا؛ لا حصة أو حد لطول الفيديو المسجل.
 MIN_FREE_MB = 0
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()}
@@ -550,10 +554,10 @@ def fmt_for(mode):
 FALLBACK = {"best": ["720", "480", "360"], "1080": ["720", "480", "360"], "720": ["480", "360"],
             "480": ["360"], "360": [], "audio": []}
 
-def do_download_fit(it, mode, outdir):
+def do_download_fit(it, mode, outdir, progress_hook=None):
     """لو الملف عدّى 2GB بينزل جودة تلقائيًا بدل ما يفشل. بيرجّع (مسار, info, الجودة_الفعلية)."""
     for m in [mode] + FALLBACK.get(mode, []):
-        path, info = do_download(it, m, outdir)
+        path, info = do_download(it, m, outdir, progress_hook)
         if os.path.getsize(path) <= MAX_SIZE:
             return path, info, m
         log.info("file too big in %s for %s, trying lower quality", m, it.url)
@@ -561,9 +565,10 @@ def do_download_fit(it, mode, outdir):
         except OSError: pass
     raise RuntimeError("الملف أكبر من 2GB حتى بأقل جودة")
 
-def do_download(it, mode, outdir):
+def do_download(it, mode, outdir, progress_hook=None):
     o = base_opts(it.referer or None)
     o.update(noplaylist=True, outtmpl=f"{outdir}/%(title).60s.%(ext)s")
+    if progress_hook: o["progress_hooks"] = [progress_hook]
     if HAS_ARIA2:
         o["external_downloader"] = {"default": "aria2c", "dash": "native",
                                     "m3u8": "native", "m3u8_native": "native"}
@@ -724,6 +729,92 @@ async def wait_disk(poll=3, tries=40):
     raise RuntimeError("السيرفر ممتلئ مؤقتًا — حاول بعد شوية")
 
 # ───────────── الإرسال ─────────────
+def human_bytes(value):
+    try: value = max(float(value or 0), 0.0)
+    except (TypeError, ValueError): value = 0.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+def progress_text(current, total=None, speed=None, eta=None, width=10):
+    current = max(float(current or 0), 0.0)
+    try: total = float(total) if total else 0.0
+    except (TypeError, ValueError): total = 0.0
+    if total > 0:
+        ratio = min(max(current / total, 0.0), 1.0)
+        filled = int(ratio * width)
+        bar = "█" * filled + "░" * (width - filled)
+        amount = f"{ratio * 100:.0f}% • {human_bytes(current)}/{human_bytes(total)}"
+    else:
+        position = int(time.monotonic() * 2) % width
+        bar = "░" * position + "█" + "░" * (width - position - 1)
+        amount = human_bytes(current)
+    parts = [f"[{bar}]", amount]
+    try:
+        if speed and float(speed) > 0: parts.append(f"{human_bytes(speed)}/s")
+    except (TypeError, ValueError): pass
+    try:
+        if eta is not None:
+            seconds = max(0, int(eta))
+            h, rem = divmod(seconds, 3600)
+            m, s = divmod(rem, 60)
+            parts.append(f"متبقٍ {f'{h:02d}:' if h else ''}{m:02d}:{s:02d}")
+    except (TypeError, ValueError, OverflowError): pass
+    return " • ".join(parts)
+
+def make_upload_progress(it, label="رفع"):
+    state = {"at": time.monotonic(), "bytes": 0, "shown": 0}
+    async def callback(current, total, *_):
+        now = time.monotonic()
+        dt = max(now - state["at"], 0.01)
+        speed = max(float(current or 0) - state["bytes"], 0) / dt
+        state.update(at=now, bytes=float(current or 0))
+        try: eta = (float(total) - float(current)) / speed if speed > 0 and total else None
+        except (TypeError, ValueError): eta = None
+        if now - state["shown"] >= 0.7 or (total and current >= total):
+            state["shown"] = now
+            it.detail = f"{label} • {progress_text(current, total, speed, eta)}"
+    return callback
+
+def make_download_progress_hook(it, loop, state):
+    throttle = {"at": 0.0}
+    def hook(data):
+        status = data.get("status")
+        now = time.monotonic()
+        if status == "downloading":
+            if now - throttle["at"] < 0.7: return
+            throttle["at"] = now
+            current = data.get("downloaded_bytes") or 0
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+            speed = data.get("speed")
+            eta = data.get("eta")
+            detail = progress_text(current, total, speed, eta)
+        elif status == "finished":
+            detail = "اكتمل تنزيل الجزء • جارٍ الدمج/المعالجة..."
+        else:
+            return
+        def publish():
+            it.detail = detail
+            state["updated"] = time.monotonic()
+        try: loop.call_soon_threadsafe(publish)
+        except RuntimeError: pass
+    return hook
+
+async def wait_with_progress(task, it, outdir, hook_state=None):
+    previous_size, previous_at = 0, time.monotonic()
+    while not task.done():
+        await asyncio.sleep(1)
+        now = time.monotonic()
+        if hook_state and now - hook_state["updated"] < 2:
+            continue
+        size = dir_size(outdir)
+        speed = max(size - previous_size, 0) / max(now - previous_at, 0.01)
+        it.detail = progress_text(size, speed=speed)
+        previous_size, previous_at = size, now
+        if hook_state: hook_state["updated"] = now
+    return await task
+
 async def send_media(b, it, src, info, thumb=None, progress=None):
     info = info or {}
     cap = (info.get("title") or it.title)[:200]
@@ -742,7 +833,8 @@ async def send_media(b, it, src, info, thumb=None, progress=None):
 
 IMG_EXT, VID_EXT = {".jpg", ".jpeg", ".png", ".webp"}, {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
-async def send_gallery(b, it, files):
+async def send_gallery(b, it, files, progress_factory=None):
+    progress_factory = progress_factory or (lambda label: None)
     cap, ext = it.title[:200], lambda f: os.path.splitext(f)[1].lower()
     imgs = [f for f in files if ext(f) in IMG_EXT and os.path.getsize(f) <= 10 * 1024 * 1024]
     vids = [f for f in files if ext(f) in VID_EXT]
@@ -753,8 +845,10 @@ async def send_gallery(b, it, files):
         chunk = imgs[i:i + 10]
         try:
             if len(chunk) == 1:
-                await app.send_photo(b.chat_id, chunk[0], caption=cap if first else None)
+                await app.send_photo(b.chat_id, chunk[0], caption=cap if first else None,
+                                     progress=progress_factory("رفع صورة"))
             else:
+                it.detail = f"رفع ألبوم الصور {i + 1}–{i + len(chunk)} من {len(imgs)}"
                 await app.send_media_group(b.chat_id, [InputMediaPhoto(p, caption=cap if (first and j == 0) else None)
                                                        for j, p in enumerate(chunk)])
         except FloodWait as e:
@@ -763,11 +857,14 @@ async def send_gallery(b, it, files):
             docs += chunk
         first = False
     for v in vids:
-        await app.send_video(b.chat_id, v, caption=cap if first else None, supports_streaming=True); first = False
+        await app.send_video(b.chat_id, v, caption=cap if first else None, supports_streaming=True,
+                             progress=progress_factory("رفع فيديو")); first = False
     for g in gifs:
-        await app.send_animation(b.chat_id, g, caption=cap if first else None); first = False
+        await app.send_animation(b.chat_id, g, caption=cap if first else None,
+                                 progress=progress_factory("رفع GIF")); first = False
     for d in docs:
-        await app.send_document(b.chat_id, d, caption=cap if first else None); first = False
+        await app.send_document(b.chat_id, d, caption=cap if first else None,
+                                progress=progress_factory("رفع ملف")); first = False
 
 # ───────────── معالجة عنصر واحد ─────────────
 async def run_item(b, it):
@@ -793,27 +890,27 @@ async def run_item(b, it):
             try:
                 if it.engine == "gallery":
                     async with user_sem(b.user_id), DL_SEM:
-                        it.status, it.detail = "dl", "بيحمل الصور..."
-                        files = await asyncio.to_thread(do_gallery, it.url, outdir)
+                        it.status, it.detail = "dl", "جارٍ تجهيز تنزيل الصور..."
+                        task = asyncio.create_task(asyncio.to_thread(do_gallery, it.url, outdir))
+                        files = await wait_with_progress(task, it, outdir)
                     if b.cancelled: raise RuntimeError("أُلغي")
                     async with UP_SEM:
-                        it.status, it.detail = "up", f"{len(files)} ملف"
-                        await with_retry(send_gallery, b, it, files, tries=2)
+                        it.status, it.detail = "up", f"بدء رفع {len(files)} ملف..."
+                        await with_retry(send_gallery, b, it, files,
+                                         lambda label: make_upload_progress(it, label), tries=2)
                     it.status = "done"; record(b.user_id, it.title, "gallery")
                     return
 
                 async with user_sem(b.user_id), DL_SEM:
-                    it.status, it.detail = "dl", "بيبدأ..."
+                    it.status, it.detail = "dl", "جارٍ تجهيز التنزيل..."
                     await wait_disk()
-                    task = asyncio.create_task(asyncio.to_thread(do_download_fit, it, b.mode, outdir))
-                    last, t0 = 0, time.time()
-                    while not task.done():
-                        await asyncio.sleep(1.5)
-                        size, now = dir_size(outdir), time.time()
-                        speed = (size - last) / max(now - t0, 0.1)
-                        last, t0 = size, now
-                        it.detail = f"{size/1e6:.0f}MB • {speed/1e6:.1f}MB/s"
-                    path, info, used = await task
+                    loop = asyncio.get_running_loop()
+                    progress_state = {"updated": time.monotonic()}
+                    hook = make_download_progress_hook(it, loop, progress_state)
+                    task = asyncio.create_task(asyncio.to_thread(
+                        do_download_fit, it, b.mode, outdir, hook))
+                    path, info, used = await wait_with_progress(task, it, outdir, progress_state)
+                    it.detail = f"[██████████] 100% • {human_bytes(os.path.getsize(path))} • اكتمل التنزيل"
                     if wm and not b.cancelled:
                         it.detail = "🔖 بيحط العلامة المائية..."
                         path = await apply_watermark(path, wm, outdir)
@@ -823,12 +920,8 @@ async def run_item(b, it):
                 if used != b.mode: log.info("quality lowered %s -> %s for %s", b.mode, used, it.url)
 
                 async with UP_SEM:
-                    it.status, it.detail = "up", "0%"
-                    tick = {"t": 0}
-                    async def prog(cur, total):
-                        if time.time() - tick["t"] > 1.5:
-                            tick["t"] = time.time()
-                            it.detail = f"{cur/total*100:.0f}%"
+                    it.status, it.detail = "up", "جارٍ تهيئة الرفع..."
+                    prog = make_upload_progress(it)
                     thumb = None if b.mode == "audio" else await make_thumb(path, f"{outdir}/thumb.jpg")
                     fid = await with_retry(send_media, b, it, path, info, thumb, prog)
                 if fid: cache_put(it.key, cm, fid)

@@ -1417,4 +1417,5 @@ async def main():
     await app.stop()
 
 if __name__ == "__main__":
-    app.run(main())
+    # في kurigram الحديثة app.run() مبقاش بياخد coroutine؛ بنشغّل main على نفس لوب العميل (اللي اتسجّلت عليه الهاندلرز)
+    app.loop.run_until_complete(main())

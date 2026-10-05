@@ -2,7 +2,7 @@
 بوت تحميل فيديوهات متطور — أزرار ملونة + دعم واسع للمواقع
 المحركات: yt-dlp (1700+ موقع) ← تقليد متصفح للمواقع المحمية ← gallery-dl (صور/ألبومات) ← كاشف فيديو في أي صفحة
 """
-import os, re, time, uuid, shutil, asyncio, tempfile, sqlite3, threading, logging
+import os, re, time, uuid, shutil, asyncio, tempfile, sqlite3, threading, logging, base64
 import socket, ipaddress, hashlib, subprocess, urllib.request, urllib.error, copy, inspect
 from collections import Counter
 from dataclasses import dataclass, field
@@ -76,10 +76,27 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
       "Chrome/124.0.0.0 Safari/537.36")
 
 COOKIES_FILE = None
-if os.getenv("COOKIES_TXT"):
+cookie_text = os.getenv("COOKIES_TXT", "").lstrip("\ufeff")
+cookies_b64 = "".join(os.getenv("COOKIES_B64", "").split())
+if cookies_b64:
+    try:
+        cookie_text = base64.b64decode(cookies_b64, validate=True).decode("utf-8-sig")
+    except Exception as e:
+        raise RuntimeError("COOKIES_B64 must be base64-encoded UTF-8 cookies.txt content") from e
+if cookie_text:
+    cookie_rows = []
+    for line in cookie_text.splitlines():
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        if len(line.split("\t")) == 7:
+            cookie_rows.append(line)
+    if not cookie_rows:
+        raise RuntimeError("COOKIES_TXT/COOKIES_B64 must contain the full Netscape cookies.txt content, not a file path")
     COOKIES_FILE = os.path.join(tempfile.gettempdir(), "cookies.txt")
     with os.fdopen(os.open(COOKIES_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:   # الكوكيز = جلسة حساب
-        f.write(os.environ["COOKIES_TXT"])
+        f.write(cookie_text)
 HAS_ARIA2 = shutil.which("aria2c") is not None
 SITE_COUNT = sum(1 for _ in list_extractor_classes())
 
@@ -150,6 +167,8 @@ for _alter in ("ALTER TABLE users ADD COLUMN quality TEXT DEFAULT 'ask'",
 # نسخة في الذاكرة من قوائم الحظر/المسموح (بدل استعلام قاعدة بيانات مع كل رسالة وكل ضغطة زرار)
 BANNED = {r[0] for r in db.execute("SELECT id FROM banned")}
 ALLOWED_DB = {r[0] for r in db.execute("SELECT id FROM allowed")}
+if COOKIES_FILE and not (ADMIN_IDS or ALLOWED_IDS or ALLOWED_DB):
+    log.error("YouTube cookies are enabled but no trusted Telegram IDs are configured; access remains private and users will be denied")
 
 def db_exec(q, args=()):
     with db_lock:
@@ -158,7 +177,7 @@ def db_exec(q, args=()):
 # ───────────── إعدادات الأدمن (بتتغير من لوحة الأدمن وبتتخزن في القاعدة) ─────────────
 # قيم المتغيرات (Variables) هنا هي القيم الابتدائية بس؛ أي تغيير من اللوحة بيتخزن ويغلب عليها.
 SETTING_DEFAULTS = {
-    "public": "0" if ALLOWED_IDS else "1",      # 1 = البوت مفتوح للكل، 0 = خاص (الأدمن + المسموح لهم)
+    "public": "0" if (ALLOWED_IDS or COOKIES_FILE) else "1",  # الكوكيز تفرض الوصول الخاص
     "wm_on": "0",                               # العلامة المائية شغّالة؟
     "wm_type": "text",                          # text | image
     "wm_text": "", "wm_img_sig": "",
@@ -169,9 +188,13 @@ CFG = dict(SETTING_DEFAULTS)
 CFG.update({k: v for k, v in db.execute("SELECT key, value FROM settings") if k in SETTING_DEFAULTS})
 
 def cfg(key):
+    if key == "public" and COOKIES_FILE:
+        return "0"
     return CFG[key]
 
 def cfg_set(key, val):
+    if key == "public" and COOKIES_FILE:
+        val = "0"
     CFG[key] = str(val)
     db_exec("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, str(val)))
 
@@ -1117,14 +1140,19 @@ async def broadcast(admin_cq, chat_id, msg_id):
 
 # ───────────── شاشات إعدادات الأدمن ─────────────
 def cf_text():
+    access = ("🔐 خاص تلقائيًا بسبب تفعيل كوكيز YouTube" if COOKIES_FILE else
+              f"👥 الوصول: {'🌍 عام (أي حد)' if cfg('public') == '1' else '🔒 خاص (الأدمن + المسموح لهم بس)'}")
     return ("⚙️ إعدادات البوت\n\n"
             "📥 عدد التنزيلات: ♾ بلا حد يومي\n"
             "⏱ مدة الفيديو المسجل: ♾ بلا حد\n"
-            f"👥 الوصول: {'🌍 عام (أي حد)' if cfg('public') == '1' else '🔒 خاص (الأدمن + المسموح لهم بس)'}\n\n"
+            f"{access}\n\n"
             "طلبات وروابط ودفعات متعددة متزامنة بلا سقف تطبيقي.\n"
             "للوصول الخاص: /allow <id> و /unallow <id> لإضافة/شيل مستخدم.")
 
 def cf_kb():
+    if COOKIES_FILE:
+        return KB([B("🔐 خاص تلقائيًا مع الكوكيز", "ad|cf|locked", S.DANGER)],
+                  [B("🔙 رجوع", "ad")])
     pub = cfg("public") == "1"
     return KB(
         [B("🌍 عام — اضغط لتخليه خاص" if pub else "🔒 خاص — اضغط لتخليه عام", "ad|cf|pub",
@@ -1392,6 +1420,8 @@ async def on_cb(_, cq):
         if sub == "cf":
             awaiting.pop(uid, None)
             a = d[2] if len(d) > 2 else ""
+            if a in ("pub", "locked") and COOKIES_FILE:
+                return await cq.answer("الوصول الخاص مفروض تلقائيًا طالما كوكيز YouTube مفعّلة.", show_alert=True)
             if a == "pub":
                 cfg_set("public", "0" if cfg("public") == "1" else "1")
             return await show(cq, cf_text(), cf_kb())
@@ -1438,9 +1468,9 @@ async def main():
     await app.start()
     try: await app.delete_bot_commands()
     except Exception as e: log.info("delete_bot_commands: %s", e)
-    log.info("sites: %s | aria2c: %s | impersonate: %s | gallery-dl: %s | uvloop: %s | upload-workers: %s | colors: %s | db: %s",
+    log.info("sites: %s | aria2c: %s | impersonate: %s | gallery-dl: %s | uvloop: %s | upload-workers: %s | cookies-configured: %s | colors: %s | db: %s",
              SITE_COUNT, HAS_ARIA2, bool(IMPERSONATE), HAS_GALLERY, HAS_UVLOOP,
-             UPLOAD_WORKERS if UPLOAD_TUNED else 4, COLORS, DB_PATH)
+             UPLOAD_WORKERS if UPLOAD_TUNED else 4, bool(COOKIES_FILE), COLORS, DB_PATH)
     await idle()
     await app.stop()
 

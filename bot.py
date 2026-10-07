@@ -2,7 +2,7 @@
 بوت تحميل فيديوهات متطور — أزرار ملونة + دعم واسع للمواقع
 المحركات: yt-dlp (1700+ موقع) ← تقليد متصفح للمواقع المحمية ← gallery-dl (صور/ألبومات) ← كاشف فيديو في أي صفحة
 """
-import os, re, time, uuid, shutil, asyncio, tempfile, sqlite3, threading, logging, base64
+import os, re, time, uuid, shutil, asyncio, tempfile, sqlite3, threading, logging
 import socket, ipaddress, hashlib, subprocess, urllib.request, urllib.error, copy, inspect
 from collections import Counter
 from dataclasses import dataclass, field
@@ -50,7 +50,6 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-PROXY = os.getenv("PROXY")
 # مفيش حدود تطبيقية للتحميل: الدفعات والقوائم والروابط والتزامن بلا سقف.
 MAX_PLAYLIST = MAX_GALLERY = 0
 TRANSFER_PROFILE = os.getenv("TRANSFER_PROFILE", "fast").strip().lower()
@@ -75,28 +74,6 @@ VALID_PREFS = {"ask", "best", "1080", "720", "480", "360", "audio"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0.0.0 Safari/537.36")
 
-COOKIES_FILE = None
-cookie_text = os.getenv("COOKIES_TXT", "").lstrip("\ufeff")
-cookies_b64 = "".join(os.getenv("COOKIES_B64", "").split())
-if cookies_b64:
-    try:
-        cookie_text = base64.b64decode(cookies_b64, validate=True).decode("utf-8-sig")
-    except Exception as e:
-        raise RuntimeError("COOKIES_B64 must be base64-encoded UTF-8 cookies.txt content") from e
-if cookie_text:
-    cookie_rows = []
-    for line in cookie_text.splitlines():
-        if line.startswith("#HttpOnly_"):
-            line = line[len("#HttpOnly_"):]
-        elif not line or line.startswith("#"):
-            continue
-        if len(line.split("\t")) == 7:
-            cookie_rows.append(line)
-    if not cookie_rows:
-        raise RuntimeError("COOKIES_TXT/COOKIES_B64 must contain the full Netscape cookies.txt content, not a file path")
-    COOKIES_FILE = os.path.join(tempfile.gettempdir(), "cookies.txt")
-    with os.fdopen(os.open(COOKIES_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:   # الكوكيز = جلسة حساب
-        f.write(cookie_text)
 HAS_ARIA2 = shutil.which("aria2c") is not None
 SITE_COUNT = sum(1 for _ in list_extractor_classes())
 
@@ -167,8 +144,6 @@ for _alter in ("ALTER TABLE users ADD COLUMN quality TEXT DEFAULT 'ask'",
 # نسخة في الذاكرة من قوائم الحظر/المسموح (بدل استعلام قاعدة بيانات مع كل رسالة وكل ضغطة زرار)
 BANNED = {r[0] for r in db.execute("SELECT id FROM banned")}
 ALLOWED_DB = {r[0] for r in db.execute("SELECT id FROM allowed")}
-if COOKIES_FILE and not (ADMIN_IDS or ALLOWED_IDS or ALLOWED_DB):
-    log.error("YouTube cookies are enabled but no trusted Telegram IDs are configured; access remains private and users will be denied")
 
 def db_exec(q, args=()):
     with db_lock:
@@ -177,7 +152,7 @@ def db_exec(q, args=()):
 # ───────────── إعدادات الأدمن (بتتغير من لوحة الأدمن وبتتخزن في القاعدة) ─────────────
 # قيم المتغيرات (Variables) هنا هي القيم الابتدائية بس؛ أي تغيير من اللوحة بيتخزن ويغلب عليها.
 SETTING_DEFAULTS = {
-    "public": "0" if (ALLOWED_IDS or COOKIES_FILE) else "1",  # الكوكيز تفرض الوصول الخاص
+    "public": "1",                               # عام افتراضيًا؛ يمكن تغييره يدويًا من لوحة الأدمن
     "wm_on": "0",                               # العلامة المائية شغّالة؟
     "wm_type": "text",                          # text | image
     "wm_text": "", "wm_img_sig": "",
@@ -186,15 +161,16 @@ SETTING_DEFAULTS = {
 }
 CFG = dict(SETTING_DEFAULTS)
 CFG.update({k: v for k, v in db.execute("SELECT key, value FROM settings") if k in SETTING_DEFAULTS})
+# إزالة القفل القديم مرة واحدة: يرجع البوت عامًا بعد التحديث، وبعدها يظل زر الأدمن قابلًا للتغيير.
+if not db_exec("SELECT value FROM settings WHERE key=?", ("public_access_reset_v1",)):
+    CFG["public"] = "1"
+    db_exec("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", ("public", "1"))
+    db_exec("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", ("public_access_reset_v1", "done"))
 
 def cfg(key):
-    if key == "public" and COOKIES_FILE:
-        return "0"
     return CFG[key]
 
 def cfg_set(key, val):
-    if key == "public" and COOKIES_FILE:
-        val = "0"
     CFG[key] = str(val)
     db_exec("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, str(val)))
 
@@ -275,10 +251,10 @@ bc_pending: dict[int, tuple] = {}
 
 # رسائل أخطاء مفهومة بالعربي
 ERR_MAP = [
-    (r"sign in to confirm|not a bot", "يوتيوب طالب تأكيد إنك مش بوت — لازم cookies أو proxy"),
+    (r"sign in to confirm|not a bot", "يوتيوب رفض الطلب المجهول حتى بعد إعادة المحاولة؛ قد يكون حجبًا لعنوان IP الاستضافة. جرّب لاحقًا أو رابطًا آخر."),
     (r"private video|video is private|this account is private", "الفيديو/الحساب خاص"),
-    (r"confirm your age|age[- ]restricted|inappropriate for some users", "محتوى متقيد بالسن — محتاج cookies"),
-    (r"login required|log in|logged in|rate-limit reached|requires? authentication|cookies", "الموقع طالب تسجيل دخول — محتاج cookies"),
+    (r"confirm your age|age[- ]restricted|inappropriate for some users", "الفيديو مقيّد بالعمر ولا يمكن تحميله في الوضع المجهول"),
+    (r"login required|log in|logged in|rate-limit reached|requires? authentication|cookies", "المحتوى يتطلب تسجيل دخول، والتنزيل المجهول غير متاح له"),
     (r"\bdrm\b|widevine", "محمي بـ DRM ومينفعش يتحمل"),
     (r"geo[- ]?restrict|not available in your country|blocked .* in your country", "محجوب في بلد السيرفر"),
     (r"live event|is live|premieres in|will begin in", "ده بث مباشر/لسه ما بدأش — حاول لما يخلص"),
@@ -355,14 +331,146 @@ def menu_kb(uid):
 def back_kb():
     return KB([B("🏠 القائمة الرئيسية", "m")])
 
-def picker_kb(bid):
-    return KB(
-        [B("🏆 أعلى جودة", f"q|{bid}|best", S.SUCCESS)],
-        [B("🎬 1080p", f"q|{bid}|1080"), B("🎬 720p", f"q|{bid}|720")],
-        [B("🎬 480p", f"q|{bid}|480"), B("🎬 360p", f"q|{bid}|360")],
-        [B("🎧 صوت MP3", f"q|{bid}|audio")],
-        [B("❌ إلغاء", f"x|{bid}", S.DANGER)],
-    )
+def duration_text(value):
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return "غير متاح"
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+def _format_size(fmt, duration):
+    for key in ("filesize", "filesize_approx"):
+        try:
+            value = int(float(fmt.get(key) or 0))
+            if value > 0: return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+    try:
+        bitrate = float(fmt.get("tbr") or fmt.get("abr") or 0)
+        seconds = float(duration or 0)
+        if bitrate > 0 and seconds > 0:
+            return int(bitrate * 1000 * seconds / 8)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+def _format_height(fmt):
+    try: return int(fmt.get("height") or 0)
+    except (TypeError, ValueError, OverflowError): return 0
+
+def _format_rank(fmt):
+    height = _format_height(fmt)
+    try: bitrate = float(fmt.get("tbr") or fmt.get("abr") or 0)
+    except (TypeError, ValueError): bitrate = 0
+    try: fps = float(fmt.get("fps") or 0)
+    except (TypeError, ValueError): fps = 0
+    h264 = str(fmt.get("vcodec") or "").startswith("avc1")
+    return height, h264, bitrate, fps
+
+def quality_modes(info):
+    formats = (info.get("formats") or []) if isinstance(info, dict) else []
+    heights = []
+    for fmt in formats:
+        if not isinstance(fmt, dict) or fmt.get("vcodec") in (None, "none"): continue
+        height = _format_height(fmt)
+        if height > 0: heights.append(height)
+    if not heights: return ["best", "1080", "720", "480", "360"]
+    modes = ["best"]
+    max_height = max(heights)
+    modes.extend(str(height) for height in sorted(set(heights), reverse=True) if height > 1080)
+    for target in (1080, 720, 480, 360):
+        if max_height >= target and any(height <= target for height in heights): modes.append(str(target))
+    return modes
+
+def audio_available(info):
+    if not isinstance(info, dict) or not info.get("formats"): return True
+    return any(isinstance(f, dict) and f.get("acodec") not in (None, "none")
+               for f in info.get("formats") or [])
+
+def thumbnail_url(info):
+    if not isinstance(info, dict): return None
+    url = info.get("thumbnail")
+    if isinstance(url, str) and url.startswith("https://"): return url
+    thumbnails = [t for t in (info.get("thumbnails") or [])
+                  if isinstance(t, dict) and isinstance(t.get("url"), str) and t["url"].startswith("https://")]
+    if not thumbnails: return None
+    def rank(t):
+        try: return int(t.get("width") or 0) * int(t.get("height") or 0)
+        except (TypeError, ValueError, OverflowError): return 0
+    return max(thumbnails, key=rank)["url"]
+
+def estimated_size(info, mode):
+    if not isinstance(info, dict): return None
+    duration = info.get("duration")
+    if mode == "audio":
+        try:
+            seconds = float(duration or 0)
+            return int(seconds * 192000 / 8) if seconds > 0 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+    target = None if mode == "best" else int(mode)
+    formats = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+    def has_video(f): return f.get("vcodec") not in (None, "none")
+    def has_audio(f): return f.get("acodec") not in (None, "none")
+    video = [f for f in formats if has_video(f) and f.get("height")]
+    if target is not None:
+        video = [f for f in video if _format_height(f) <= target]
+    if not video: return None
+    video.sort(key=_format_rank, reverse=True)
+    separate_video = [f for f in video if not has_audio(f)]
+    combined = [f for f in video if has_audio(f)]
+    if separate_video:
+        vfmt = separate_video[0]
+        audio = [f for f in formats if has_audio(f) and not has_video(f)]
+        audio.sort(key=_format_rank, reverse=True)
+        vsize = _format_size(vfmt, duration)
+        asize = _format_size(audio[0], duration) if audio else None
+        if vsize is not None and asize is not None: return vsize + asize
+    if combined:
+        combined.sort(key=_format_rank, reverse=True)
+        return _format_size(combined[0], duration)
+    return None
+
+def quality_button_label(info, mode):
+    label = {"best": "🏆 أعلى جودة", "audio": "🎧 MP3", "1080": "🎬 1080p",
+             "720": "🎬 720p", "480": "🎬 480p", "360": "🎬 360p"}.get(mode, f"🎬 {mode}p")
+    size = estimated_size(info, mode)
+    return f"{label} · ~{human_bytes(size)}" if size else label
+
+def picker_kb(bid, info=None):
+    modes = quality_modes(info) if info else ["best", "1080", "720", "480", "360"]
+    rows = [[B(quality_button_label(info, "best"), f"q|{bid}|best", S.SUCCESS)]]
+    video_modes = [m for m in modes if m != "best"]
+    for i in range(0, len(video_modes), 2):
+        rows.append([B(quality_button_label(info, m), f"q|{bid}|{m}") for m in video_modes[i:i + 2]])
+    if audio_available(info): rows.append([B(quality_button_label(info, "audio"), f"q|{bid}|audio")])
+    rows.append([B("❌ إلغاء", f"x|{bid}", S.DANGER)])
+    return KB(*rows)
+
+def metadata_text(items, playlist_title=None):
+    if len(items) != 1 or items[0].engine != "ytdlp" or not items[0].info:
+        text = (f"📋 {_escape_metadata_title(playlist_title, 120)}\n" if playlist_title else "") + f"🎬 لقيت {len(items)} عنصر:\n"
+        text += "\n".join(f"• {_escape_metadata_title(item.title, 55)}" for item in items[:6])
+        if len(items) > 6: text += f"\n... و{len(items) - 6} كمان"
+        return text + "\n\nاختار الجودة التي ستُطبق على العناصر:"
+    item, info = items[0], items[0].info
+    title = _escape_metadata_title(info.get("title") or item.title or "فيديو", 180)
+    lines = [f"🎬 {title}", f"⏱️ المدة: {duration_text(info.get('duration'))}"]
+    heights = sorted({_format_height(f) for f in (info.get("formats") or [])
+                      if isinstance(f, dict) and _format_height(f) and f.get("vcodec") not in (None, "none")}, reverse=True)
+    if heights: lines.append("📺 المتاح: " + "، ".join(f"{h}p" for h in heights[:8]))
+    lines.append("🎞️ الصيغة المتوقعة للفيديو: MP4")
+    if audio_available(info): lines.append("🎧 يوجد خيار صوت MP3")
+    lines.append("📦 الحجم المتوقع لكل اختيار يظهر على الزر (تقديري وقد لا يقدمه المصدر).")
+    lines.append("🛡️ يبدأ التنزيل بعد اختيارك إذا كان الرابط متاحًا وغير محمي.")
+    lines.append("\nاختر الجودة:")
+    return "\n".join(lines)
+
+def _escape_metadata_title(value, limit):
+    text = " ".join(str(value or "").split())[:limit]
+    return re.sub(r"([_*`\[\]])", r"\\\1", text)
 
 def cancel_kb(b):
     return KB([B("🛑 إلغاء", f"c|{b.id}", S.DANGER)])
@@ -392,9 +500,24 @@ def admin_kb():
     )
 
 # ───────────── yt-dlp (مع تقليد المتصفح) ─────────────
-RETRY_IMP = re.compile(r"403|forbidden|cloudflare|just a moment|captcha|429|impersonat|"
+YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+RETRY_IMP = re.compile(r"403|forbidden|cloudflare|just a moment|captcha|429|impersonat|not a bot|"
                        r"unable to download webpage|unsupported url|timed out|challenge", re.I)
+RETRY_YT_ANON = re.compile(r"sign in to confirm|not a bot|login_required|po.?token|http error 403", re.I)
 ARIA2_EXIT = re.compile(r"aria2c exited with code\s+(\d+)", re.I)
+
+def is_youtube_url(url):
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in YT_HOSTS)
+
+def youtube_android_vr_opts(opts):
+    """Use an anonymous YouTube client that currently does not require a PO token."""
+    retry = copy.deepcopy(opts)
+    args = retry.setdefault("extractor_args", {})
+    yt_args = dict(args.get("youtube") or {})
+    yt_args["player_client"] = ["android_vr"]
+    args["youtube"] = yt_args
+    return retry
 
 def aria2_exit_code(error):
     match = ARIA2_EXIT.search(str(error))
@@ -418,13 +541,11 @@ def note_aria2_failure(error):
 def base_opts(referer=None):
     o = {"quiet": True, "no_warnings": True, "retries": 10, "fragment_retries": 10,
          "socket_timeout": 30, "concurrent_fragment_downloads": FRAGMENTS, "noprogress": True}
-    if COOKIES_FILE: o["cookiefile"] = COOKIES_FILE
-    if PROXY: o["proxy"] = PROXY
     if referer: o["http_headers"] = {"Referer": referer, "User-Agent": UA}
     return o
 
 def ydl_run(url, opts, download):
-    """يجرب عادي، ولو اتحجب يعيد بتقليد متصفح Chrome."""
+    """يجرب افتراضيًا بلا جلسة؛ لرفض YouTube يعيد بعميل Android VR مجهول ثم Chrome impersonation."""
     try:
         with yt_dlp.YoutubeDL(opts) as y:
             return y.extract_info(url, download=download)
@@ -440,7 +561,18 @@ def ydl_run(url, opts, download):
             except Exception as native_error:
                 error = native_error
                 log.warning("native downloader retry failed: %s", native_error)
-        if IMPERSONATE and RETRY_IMP.search(str(error)):
+        if is_youtube_url(url) and RETRY_YT_ANON.search(str(error)):
+            anonymous = youtube_android_vr_opts(opts)
+            if not HAS_ARIA2:
+                anonymous = native_downloader_opts(anonymous)
+            log.warning("YouTube rejected the default anonymous client; retrying with android_vr (no cookies/proxy)")
+            try:
+                with yt_dlp.YoutubeDL(anonymous) as y:
+                    return y.extract_info(url, download=download)
+            except Exception as anonymous_error:
+                error = anonymous_error
+                log.warning("YouTube android_vr retry failed: %s", anonymous_error)
+        if IMPERSONATE and (RETRY_IMP.search(str(error)) or RETRY_IMP.search(str(initial_error))):
             o2 = native_downloader_opts(opts)
             o2["impersonate"] = IMPERSONATE
             try:
@@ -449,8 +581,6 @@ def ydl_run(url, opts, download):
             except Exception as impersonate_error:
                 error = impersonate_error
         raise error
-
-YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 
 def is_single_video(url):
     """فيديو يوتيوب مفرد (مش Playlist). المواقع التانية بيقررها yt-dlp نفسه."""
@@ -502,8 +632,7 @@ def _get_once(url):
     try:
         if IMPERSONATE:
             from curl_cffi import requests as cr
-            r = cr.get(url, impersonate="chrome", timeout=20, allow_redirects=False,
-                       proxies={"http": PROXY, "https": PROXY} if PROXY else None)
+            r = cr.get(url, impersonate="chrome", timeout=20, allow_redirects=False)
             if r.status_code in _REDIRECT_CODES and r.headers.get("location"):
                 return "", r.headers["location"]
             return r.text[:3_000_000], None
@@ -560,8 +689,6 @@ def gallery_supported(url):
 def do_gallery(url, outdir):
     cmd = ["gallery-dl", "-q", "-D", outdir, "-f", "{num:>03}.{extension}"]
     if MAX_GALLERY > 0: cmd += ["--range", f"1-{MAX_GALLERY}"]
-    if COOKIES_FILE: cmd += ["-C", COOKIES_FILE]
-    if PROXY: cmd += ["--proxy", PROXY]
     r = subprocess.run(cmd + [url], capture_output=True, text=True)
     files = sorted(os.path.join(outdir, f) for f in os.listdir(outdir)
                    if os.path.isfile(os.path.join(outdir, f)) and not f.endswith((".json", ".txt", ".part")))
@@ -605,12 +732,18 @@ def fmt_for(mode):
     h = f"[height<={mode}]"
     return (f"bv*{h}[vcodec^=avc1]{SZ}+ba[ext=m4a]/bv*{h}{SZ}+ba/b{h}{SZ}/b{h}/b")
 
-FALLBACK = {"best": ["720", "480", "360"], "1080": ["720", "480", "360"], "720": ["480", "360"],
+FALLBACK = {"best": ["1080", "720", "480", "360"], "1080": ["720", "480", "360"], "720": ["480", "360"],
             "480": ["360"], "360": [], "audio": []}
+
+def fallback_qualities(mode):
+    if mode in FALLBACK: return FALLBACK[mode]
+    try: target = int(mode)
+    except (TypeError, ValueError): return []
+    return [str(height) for height in (2160, 1440, 1080, 720, 480, 360) if height < target]
 
 def do_download_fit(it, mode, outdir, progress_hook=None):
     """لو الملف عدّى 2GB بينزل جودة تلقائيًا بدل ما يفشل. بيرجّع (مسار, info, الجودة_الفعلية)."""
-    for m in [mode] + FALLBACK.get(mode, []):
+    for m in [mode] + fallback_qualities(mode):
         path, info = do_download(it, m, outdir, progress_hook)
         if os.path.getsize(path) <= MAX_SIZE:
             return path, info, m
@@ -1020,6 +1153,15 @@ async def safe_edit(msg, text, kb=None):
     except FloodWait as e: await asyncio.sleep(min(e.value, 15))
     except Exception as e: log.debug("edit failed: %s", e)
 
+async def replace_with_reply(old_msg, original_msg, text, kb=None):
+    try:
+        await old_msg.delete()
+    except Exception as e:
+        log.debug("could not delete metadata wait message: %s", e)
+        await old_msg.edit_text(text, reply_markup=kb)
+        return old_msg
+    return await original_msg.reply_text(text, reply_markup=kb)
+
 async def run_batch(b):
     b.started = True
     b.started_at = time.time()
@@ -1140,8 +1282,7 @@ async def broadcast(admin_cq, chat_id, msg_id):
 
 # ───────────── شاشات إعدادات الأدمن ─────────────
 def cf_text():
-    access = ("🔐 خاص تلقائيًا بسبب تفعيل كوكيز YouTube" if COOKIES_FILE else
-              f"👥 الوصول: {'🌍 عام (أي حد)' if cfg('public') == '1' else '🔒 خاص (الأدمن + المسموح لهم بس)'}")
+    access = f"👥 الوصول: {'🌍 عام (أي حد)' if cfg('public') == '1' else '🔒 خاص (الأدمن + المسموح لهم بس)'}"
     return ("⚙️ إعدادات البوت\n\n"
             "📥 عدد التنزيلات: ♾ بلا حد يومي\n"
             "⏱ مدة الفيديو المسجل: ♾ بلا حد\n"
@@ -1150,9 +1291,6 @@ def cf_text():
             "للوصول الخاص: /allow <id> و /unallow <id> لإضافة/شيل مستخدم.")
 
 def cf_kb():
-    if COOKIES_FILE:
-        return KB([B("🔐 خاص تلقائيًا مع الكوكيز", "ad|cf|locked", S.DANGER)],
-                  [B("🔙 رجوع", "ad")])
     pub = cfg("public") == "1"
     return KB(
         [B("🌍 عام — اضغط لتخليه خاص" if pub else "🔒 خاص — اضغط لتخليه عام", "ad|cf|pub",
@@ -1288,10 +1426,17 @@ async def on_message(_, m):
         return await m.reply_text("❌ الرابط غير صالح.", reply_markup=back_kb())
     wait = await m.reply_text(f"⏳ بفحص {len(urls)} رابط...")
     async def _probe(u):
-        hit = await asyncio.to_thread(urlmap_get, u)          # اتحمل قبل كده؟ بنتخطى الفحص ونرد فورًا من الكاش
-        if hit: return [Item(u, hit[1] or u, hit[0])], None
-        async with PROBE_SEM:
-            return await asyncio.to_thread(probe, u)
+        hit = await asyncio.to_thread(urlmap_get, u)
+        try:
+            async with PROBE_SEM:
+                result = await asyncio.to_thread(probe, u)
+            if hit and len(result[0]) == 1 and result[0][0].engine == "ytdlp":
+                result[0][0].key = hit[0]   # احتفظ بمفتاح كاش الملف بعد فحص metadata الجديد
+                if not result[0][0].title: result[0][0].title = hit[1] or u
+            return result
+        except Exception:
+            if hit: return [Item(u, hit[1] or u, hit[0])], None
+            raise
     results = await asyncio.gather(*[_probe(u) for u in urls], return_exceptions=True)
     items, fails, pl = [], [], None
     for u, r in zip(urls, results):
@@ -1308,17 +1453,35 @@ async def on_message(_, m):
 
     pref = get_pref(uid)
     only_gallery = all(i.engine == "gallery" for i in items)
+    preview_info = items[0].info if len(items) == 1 and items[0].engine == "ytdlp" else None
+    preview_sent = False
+    if preview_info:
+        thumbnail = thumbnail_url(preview_info)
+        if isinstance(thumbnail, str) and thumbnail.startswith("https://"):
+            try:
+                if await asyncio.to_thread(is_safe_url, thumbnail):
+                    await app.send_photo(m.chat.id, thumbnail, reply_to_message_id=m.id)
+                    preview_sent = True
+            except Exception as e:
+                log.debug("thumbnail preview unavailable: %s", e)
+    summary = metadata_text(items, pl)
+    if fails: summary += "\n\n⚠️ روابط لم تنجح:\n" + "\n".join(_escape_metadata_title(f, 120) for f in fails[:3])
     if pref != "ask" or only_gallery:         # جودة افتراضية، أو صور بس (مفيش جودة تتختار)
         b.mode = "best" if only_gallery else pref
-        await safe_edit(wait, render(b), cancel_kb(b))
+        if preview_sent:
+            wait = await replace_with_reply(wait, m, summary + f"\n\n⚡ هبدأ الآن بالجودة الافتراضية: {mode_label(b.mode)}", cancel_kb(b))
+            b.msg = wait
+        elif not only_gallery:
+            await safe_edit(wait, summary + f"\n\n⚡ هبدأ الآن بالجودة الافتراضية: {mode_label(b.mode)}", cancel_kb(b))
+        else:
+            await safe_edit(wait, render(b), cancel_kb(b))
         return await begin(b)
 
-    txt = (f"📋 {pl}\n" if pl else "") + f"🎬 لقيت {len(items)} عنصر:\n"
-    txt += "\n".join(f"• {i.title[:45]}" for i in items[:6])
-    if len(items) > 6: txt += f"\n... و{len(items)-6} كمان"
-    if fails: txt += "\n\n⚠️ فشل:\n" + "\n".join(fails[:3])
-    txt += "\n\nاختار الجودة:"
-    await wait.edit_text(txt, reply_markup=picker_kb(b.id))
+    if preview_sent:
+        wait = await replace_with_reply(wait, m, summary, picker_kb(b.id, preview_info))
+        b.msg = wait
+    else:
+        await wait.edit_text(summary, reply_markup=picker_kb(b.id, preview_info))
 
 @app.on_callback_query()
 async def on_cb(_, cq):
@@ -1361,9 +1524,14 @@ async def on_cb(_, cq):
         b = batches.get(d[1])
         if not b or b.user_id != uid or b.started:
             return await cq.answer("انتهت صلاحية الطلب، ابعت الرابط تاني.", show_alert=True)
-        if d[2] not in VALID_PREFS or d[2] == "ask":
+        mode = d[2]
+        dynamic_resolution = (len(b.items) == 1 and mode.isdigit()
+                              and mode in quality_modes(b.items[0].info or {}))
+        audio_ok = mode == "audio" and (len(b.items) != 1 or audio_available(b.items[0].info or {}))
+        if ((mode not in VALID_PREFS and not dynamic_resolution) or mode == "ask"
+                or (mode == "audio" and not audio_ok)):
             return await cq.answer("اختيار غير صالح", show_alert=True)
-        b.mode = d[2]
+        b.mode = mode
         b.started = True            # يمنع الضغط المزدوج على الزرار من تشغيل الدفعة مرتين
         await cq.answer("بدأنا 🚀")
         return await begin(b)
@@ -1420,8 +1588,6 @@ async def on_cb(_, cq):
         if sub == "cf":
             awaiting.pop(uid, None)
             a = d[2] if len(d) > 2 else ""
-            if a in ("pub", "locked") and COOKIES_FILE:
-                return await cq.answer("الوصول الخاص مفروض تلقائيًا طالما كوكيز YouTube مفعّلة.", show_alert=True)
             if a == "pub":
                 cfg_set("public", "0" if cfg("public") == "1" else "1")
             return await show(cq, cf_text(), cf_kb())
@@ -1468,9 +1634,9 @@ async def main():
     await app.start()
     try: await app.delete_bot_commands()
     except Exception as e: log.info("delete_bot_commands: %s", e)
-    log.info("sites: %s | aria2c: %s | impersonate: %s | gallery-dl: %s | uvloop: %s | upload-workers: %s | cookies-configured: %s | colors: %s | db: %s",
+    log.info("sites: %s | aria2c: %s | impersonate: %s | gallery-dl: %s | uvloop: %s | upload-workers: %s | colors: %s | db: %s",
              SITE_COUNT, HAS_ARIA2, bool(IMPERSONATE), HAS_GALLERY, HAS_UVLOOP,
-             UPLOAD_WORKERS if UPLOAD_TUNED else 4, bool(COOKIES_FILE), COLORS, DB_PATH)
+             UPLOAD_WORKERS if UPLOAD_TUNED else 4, COLORS, DB_PATH)
     await idle()
     await app.stop()
 

@@ -37,6 +37,7 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vidbot")
+PROCESS_STARTED_AT = time.monotonic()
 
 try:    # event loop أسرع (لازم يتفعّل قبل إنشاء الـ Client)
     import uvloop
@@ -183,7 +184,7 @@ def cache_put(key, mode, fid):
             (key, mode, fid, int(time.time())))
 
 def urlmap_get(url):
-    """رابط اتحمل قبل كده وليه نسخة في الكاش → بنتخطى الفحص (2-5 ثواني) ونرد فورًا. بيرجّع (key, title) أو None."""
+    """يعيد مفتاح الكاش وعنوان الرابط السابق إن وُجدا؛ ما زال metadata يُفحص قبل عرض الاختيارات."""
     r = db_exec("SELECT m.key, m.title FROM urlmap m WHERE m.url=? "
                 "AND EXISTS (SELECT 1 FROM cache c WHERE c.key = m.key)", (url,))
     return r[0] if r else None
@@ -251,7 +252,7 @@ bc_pending: dict[int, tuple] = {}
 
 # رسائل أخطاء مفهومة بالعربي
 ERR_MAP = [
-    (r"sign in to confirm|not a bot", "يوتيوب رفض الطلب المجهول حتى بعد إعادة المحاولة؛ قد يكون حجبًا لعنوان IP الاستضافة. جرّب لاحقًا أو رابطًا آخر."),
+    (r"sign in to confirm|not a bot", "يوتيوب طلب تسجيل الدخول أو حجب عنوان IP الاستضافة. دي مشكلة وصول من الشبكة مش سرعة التنزيل؛ من غير كوكيز أو تغيير عنوان الخروج مفيش حل مضمون. جرّب لاحقًا أو رابطًا آخر."),
     (r"private video|video is private|this account is private", "الفيديو/الحساب خاص"),
     (r"confirm your age|age[- ]restricted|inappropriate for some users", "الفيديو مقيّد بالعمر ولا يمكن تحميله في الوضع المجهول"),
     (r"login required|log in|logged in|rate-limit reached|requires? authentication|cookies", "المحتوى يتطلب تسجيل دخول، والتنزيل المجهول غير متاح له"),
@@ -473,7 +474,7 @@ def _escape_metadata_title(value, limit):
     return re.sub(r"([_*`\[\]])", r"\\\1", text)
 
 def cancel_kb(b):
-    return KB([B("🛑 إلغاء", f"c|{b.id}", S.DANGER)])
+    return KB([B("⏹ إيقاف التنزيل", f"c|{b.id}", S.DANGER)])
 
 def after_kb():
     return KB([B("➕ تحميل جديد", "dl", S.SUCCESS)], [B("🏠 القائمة الرئيسية", "m")])
@@ -511,7 +512,7 @@ def is_youtube_url(url):
     return any(host == h or host.endswith("." + h) for h in YT_HOSTS)
 
 def youtube_android_vr_opts(opts):
-    """Use an anonymous YouTube client that currently does not require a PO token."""
+    """Best-effort anonymous fallback; YouTube may still reject the hosting IP or limit formats."""
     retry = copy.deepcopy(opts)
     args = retry.setdefault("extractor_args", {})
     yt_args = dict(args.get("youtube") or {})
@@ -940,23 +941,26 @@ def progress_text(current, total=None, speed=None, eta=None, width=10):
         ratio = min(max(current / total, 0.0), 1.0)
         filled = int(ratio * width)
         bar = "█" * filled + "░" * (width - filled)
-        amount = f"{ratio * 100:.0f}% • {human_bytes(current)}/{human_bytes(total)}"
+        heading = f"[{bar}] {int(ratio * 100)}%"
+        amount = f"{human_bytes(current)} / {human_bytes(total)}"
     else:
         position = int(time.monotonic() * 2) % width
         bar = "░" * position + "█" + "░" * (width - position - 1)
+        heading = f"[{bar}]"
         amount = human_bytes(current)
-    parts = [f"[{bar}]", amount]
+    parts = [amount]
     try:
-        if speed and float(speed) > 0: parts.append(f"{human_bytes(speed)}/s")
+        if speed and float(speed) > 0: parts.append(f"⚡ {human_bytes(speed)}/s")
     except (TypeError, ValueError): pass
     try:
         if eta is not None:
             seconds = max(0, int(eta))
             h, rem = divmod(seconds, 3600)
             m, s = divmod(rem, 60)
-            parts.append(f"متبقٍ {f'{h:02d}:' if h else ''}{m:02d}:{s:02d}")
+            eta_text = f"{h}h {m}m {s}s" if h else f"{m}m {s:02d}s" if m else f"{s}s"
+            parts.append(f"⏱ {eta_text}")
     except (TypeError, ValueError, OverflowError): pass
-    return " • ".join(parts)
+    return heading + "\n" + " • ".join(parts)
 
 def make_upload_progress(it, label="رفع"):
     state = {"at": time.monotonic(), "bytes": 0, "shown": 0}
@@ -1138,7 +1142,8 @@ def render(b, final=False):
     active = [i for i in b.items if i.status in ("dl", "up")]
     if active: txt += "\n"
     for i in active[:6]:
-        txt += f"{'⬇️' if i.status == 'dl' else '⬆️'} {i.detail} — {i.title[:35]}\n"
+        index = b.items.index(i) + 1
+        txt += f"🚀 جار التحميل والإرسال إليك... {index}/{len(b.items)}\n{i.detail}\n🎬 {i.title[:35]}\n\n"
     errs = [i for i in b.items if i.status == "err"]
     if errs: txt += "\n"
     for i in errs[-4:]:
@@ -1194,7 +1199,7 @@ HELP = ("❓ ازاي أستخدم البوت؟\n\n"
         "📋 لينك Playlist بيتحمّل كله\n"
         "📷 لينكات الصور والألبومات بتتبعت صور\n"
         "🔎 لو الموقع مش معروف، بدوّر على الفيديو جوه الصفحة لوحدي\n"
-        "⚡ أي فيديو اتحمل قبل كده بيتبعت فورًا\n"
+        "⚡ النسخة المخزنة بتتبعت من الكاش بعد الاختيار بدل إعادة تنزيل المصدر\n"
         "⚙️ من الإعدادات تثبّت جودة افتراضية وتتخطى سؤال الجودة")
 
 def sites_text():
@@ -1225,10 +1230,96 @@ def _dl_stream(n):
 
 def speed_download_test(streams=4, size=25 * 1024 * 1024):
     from concurrent.futures import ThreadPoolExecutor
-    t = time.time()
+    t = time.monotonic()
     with ThreadPoolExecutor(streams) as ex:
         total = sum(ex.map(_dl_stream, [size] * streams))
-    return total / (time.time() - t) / 1e6          # MB/s
+    return total / max(time.monotonic() - t, 0.001) / 1e6  # MB/s decimal, aggregate streams
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="ascii") as f: return f.read().strip()
+    except (OSError, UnicodeError):
+        return None
+
+def _cgroup_memory():
+    pairs = (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+             ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+             ("/sys/fs/cgroup/memory.usage_in_bytes", "/sys/fs/cgroup/memory.limit_in_bytes"))
+    for current_path, limit_path in pairs:
+        current, raw_limit = _read_text(current_path), _read_text(limit_path)
+        try:
+            if current is None or raw_limit is None or raw_limit == "max": continue
+            current, limit = int(current), int(raw_limit)
+            if 0 < limit < (1 << 60): return current, limit
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None, None
+
+def _cgroup_cpu_limit():
+    raw = _read_text("/sys/fs/cgroup/cpu.max")
+    if raw:
+        try:
+            quota, period = raw.split()[:2]
+            if quota != "max" and int(period) > 0: return int(quota) / int(period)
+        except (ValueError, ZeroDivisionError):
+            pass
+    quota, period = _read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    try:
+        if quota and period and int(quota) > 0 and int(period) > 0: return int(quota) / int(period)
+    except (ValueError, ZeroDivisionError):
+        pass
+    return None
+
+def _process_rss_bytes():
+    status = _read_text("/proc/self/status")
+    if status:
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                try: return int(line.split()[1]) * 1024
+                except (IndexError, ValueError): break
+    return None
+
+def _allowed_cpu_count():
+    try: return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError): return os.cpu_count()
+
+def _cpu_sample_percent(interval=0.4):
+    """نسبة استهلاك عملية البوت من نواة واحدة خلال عينة قصيرة؛ قد تتجاوز 100% عند تعدد الخيوط."""
+    wall_start, cpu_start = time.monotonic(), time.process_time()
+    time.sleep(interval)
+    elapsed = max(time.monotonic() - wall_start, 0.001)
+    return max(0.0, (time.process_time() - cpu_start) / elapsed * 100)
+
+def runtime_metrics_text():
+    cpu_pct = _cpu_sample_percent()
+    cores = _allowed_cpu_count()
+    cpu_limit = _cgroup_cpu_limit()
+    rss = _process_rss_bytes()
+    mem_current, mem_limit = _cgroup_memory()
+    uptime = max(0, int(time.monotonic() - PROCESS_STARTED_AT))
+    days, rem = divmod(uptime, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    uptime_text = f"{days}ي {hours:02}س {minutes:02}د" if days else f"{hours:02}س {minutes:02}د {seconds:02}ث"
+    lines = [f"🖥 CPU عملية البوت: {cpu_pct:.1f}% من نواة واحدة"
+             + (f" | حصة cgroup: {cpu_limit:.2f} نواة" if cpu_limit else f" | أنوية CPU المسموحة: {cores or 'غير متاح'}")]
+    if mem_current is not None and mem_limit:
+        lines.append(f"🧠 RAM الحاوية: {mem_current / 1048576:.0f}/{mem_limit / 1048576:.0f} MiB")
+    else:
+        lines.append("🧠 RAM الحاوية: حد cgroup غير متاح")
+    if rss is not None: lines.append(f"   ذاكرة عملية البوت RSS: {rss / 1048576:.0f} MiB")
+    paths = [("تنزيلات /tmp", tempfile.gettempdir())]
+    data_dir = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+    if os.path.isdir(data_dir) and os.path.realpath(data_dir) != os.path.realpath(tempfile.gettempdir()):
+        paths.append(("بيانات DB", data_dir))
+    for label, path in paths:
+        try:
+            disk = shutil.disk_usage(path)
+            lines.append(f"💾 {label}: متاح {disk.free / 1073741824:.2f}/{disk.total / 1073741824:.2f} GiB")
+        except OSError:
+            lines.append(f"💾 {label}: غير متاح")
+    lines.append(f"⏱ مدة تشغيل العملية: {uptime_text}")
+    return "\n".join(lines)
 
 _speed_running = False
 
@@ -1241,25 +1332,26 @@ async def speed_test(cq):
     msg, path = cq.message, None
     again = KB([B("🔄 اختبار تاني", "ad|sp", S.SUCCESS)], [B("🔙 رجوع", "ad")])
     try:
-        await safe_edit(msg, "⚡ بقيس سرعة التحميل (100MB)...")
+        await safe_edit(msg, "⚡ عينة تنزيل من Cloudflare: 4 اتصالات × 25 MiB...")
         try:
             dl = await asyncio.to_thread(speed_download_test)
             dl_txt = f"{dl:.1f} MB/s (≈ {dl*8:.0f} Mbps)"
         except Exception as e:
             dl, dl_txt = None, f"فشل ({clean_err(e)[:40]})"
-        await safe_edit(msg, f"⬇️ التحميل: {dl_txt}\n\n⚡ بقيس سرعة الرفع لتليجرام (40MB)...")
+        await safe_edit(msg, f"⬇️ Cloudflare: {dl_txt}\n\n⚡ عينة رفع إلى Telegram (40 MiB)...")
         fd, path = tempfile.mkstemp(prefix="speed_", suffix=".bin")
         with os.fdopen(fd, "wb") as f:
             for _ in range(40): f.write(os.urandom(1 << 20))
-        t = time.time()
+        t = time.monotonic()
         m = await app.send_document(msg.chat.id, path, caption="speed test")
-        up = 40 * 1.048576 / (time.time() - t)
+        up = 40 * 1.048576 / max(time.monotonic() - t, 0.001)
         try: await m.delete()
         except Exception: pass
         verdict = ("🟢 ممتازة" if up >= 15 else "🟡 كويسة" if up >= 6 else "🔴 بطيئة — جرّب region تاني أو VPS قريب من تليجرام")
-        await safe_edit(msg, f"⚡ نتيجة اختبار السرعة\n\n⬇️ التحميل: {dl_txt}\n⬆️ الرفع لتليجرام: "
-                             f"{up:.1f} MB/s (≈ {up*8:.0f} Mbps)\n\nالرفع: {verdict}\n"
-                             f"(رفع متوازي: {UPLOAD_WORKERS if UPLOAD_TUNED else 4})", again)
+        await safe_edit(msg, f"⚡ قياس عينة نقل من الخادم الحالي\n\n⬇️ Cloudflare (4×25 MiB): {dl_txt}\n"
+                             f"⬆️ Telegram (40 MiB): {up:.1f} MB/s (≈ {up*8:.0f} Mbps)\n\n"
+                             f"الرفع: {verdict}\n(رفع متوازي: {UPLOAD_WORKERS if UPLOAD_TUNED else 4})\n\n"
+                             "⚠️ هذه عينة وقتية وليست أقصى سعة للبوت أو سرعة YouTube؛ تختلف حسب الشبكة والخادم.", again)
     except Exception as e:
         await safe_edit(msg, f"❌ الاختبار فشل: {clean_err(e)}", again)
     finally:
@@ -1561,11 +1653,20 @@ async def on_cb(_, cq):
             c = db_exec("SELECT COUNT(*) FROM cache")[0][0]
             act24 = db_exec("SELECT COUNT(DISTINCT user_id) FROM history WHERE ts > ?", (int(time.time()) - 86400,))[0][0]
             bn = db_exec("SELECT COUNT(*) FROM banned")[0][0]
+            current_batches = list(batches.values())
+            pending_batches = sum(not b.started and not b.done for b in current_batches)
+            running_batches = sum(b.started and not b.done for b in current_batches)
+            downloading = sum(it.status == "dl" for b in current_batches for it in b.items)
+            uploading = sum(it.status == "up" for b in current_batches for it in b.items)
+            runtime = await asyncio.to_thread(runtime_metrics_text)
             return await show(cq, f"📊 إحصائيات\n\n👥 مستخدمين: {u[0]}\n📥 تحميلات: {u[1]}\n"
-                                  f"⚡ في الكاش: {c}\n🔄 دفعات شغالة: {len(batches)}\n"
+                                  f"⚡ نسخ في الكاش: {c}\n⏳ طلبات تنتظر اختيار الجودة: {pending_batches} | "
+                                  f"⚙️ دفعات بدأت: {running_batches}\n⬇️ عناصر تنزل الآن: {downloading} | "
+                                  f"⬆️ عناصر ترفع الآن: {uploading}\n"
                                   f"👤 نشطين 24س: {act24}  |  🚫 محظورين: {bn}" + chr(10) +
                                   f"🚦 حدود التنزيل: بلا حد  |  الوصول: {'عام' if cfg('public') == '1' else 'خاص'}\n"
                                   f"💧 علامة مائية: {'✅' if cfg('wm_on') == '1' else '⛔'}\n\n"
+                                  f"{runtime}\n\n"
                                   f"🧩 aria2c: {'✅' if HAS_ARIA2 else '❌'}  "
                                   f"تقليد المتصفح: {'✅' if IMPERSONATE else '❌'}  "
                                   f"gallery-dl: {'✅' if HAS_GALLERY else '❌'}\n"
